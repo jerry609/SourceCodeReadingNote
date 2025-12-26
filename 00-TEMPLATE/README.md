@@ -24,6 +24,18 @@
 ## 5. 重点类/结构体 (Key Structures)
 *   `StructName`: 作用及生命周期
 
-## 6. 思考与重构 (Reflections)
+## 6. 惊艳之处 (Highlights)
+*   [惊艳之处](highlights.md): 令人印象深刻的设计、优雅的实现、巧妙的技巧
+
+## 7. 关键算法 (Key Algorithms)
+*   [关键算法](algorithms.md): 核心算法原理、复杂度、实现细节
+
+## 8. 权衡取舍 (Tradeoffs)
+*   [权衡取舍](tradeoffs.md): 设计决策的利弊分析
+
+## 9. 疑问与解答 (Q&A)
+*   [问题列表](questions.md)
+
+## 10. 思考与重构 (Reflections)
 *   如果用 Rust 重写，这里怎么设计？
 *   这个设计模式的优缺点是什么？
