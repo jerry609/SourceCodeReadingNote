@@ -1,6 +1,6 @@
 # SourceCodeReadingNote
 
-> 优秀开源项目源码阅读笔记，记录架构设计、核心算法、highlight（主观）与权衡取舍（trade off）。
+> 开源项目源码阅读笔记，记录架构设计、核心算法、highlight（主观）与权衡取舍（trade off）。
 
 ## 项目列表
 
