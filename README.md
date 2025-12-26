@@ -31,7 +31,7 @@ Project/
 ├── flows/             # 关键路径分析 (Lookup, Read, Write...)
 ├── modules/           # 模块详解 (含源码位置引用)
 ├── questions.md       # 疑问与解答
-├── highlights.md      # 惊艳之处 - 值得学习的设计
+├── highlights.md      # 印象深刻之处 - 值得学习的设计
 ├── algorithms.md      # 关键算法 - 原理与复杂度分析
 ├── tradeoffs.md       # 权衡取舍 - 设计决策分析
 └── exercises/         # 实战练习 (如 Rust 重写任务)
