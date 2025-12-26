@@ -1,0 +1,29 @@
+# [Project Name] 源码分析笔记
+
+## 1. 项目概览 (Overview)
+*   **类型**: (e.g., 分布式文件系统, 强化学习框架)
+*   **核心语言**: (e.g., Go, Python, TypeScript)
+*   **一句话描述**: 解决什么核心问题？
+*   **阅读目标**: (e.g., 理解元数据管理，用 Rust 重写)
+
+## 2. 核心架构 (Architecture)
+*(在此处绘制或描述系统的高层架构图)*
+
+*   **组件 A**: 职责描述
+*   **组件 B**: 职责描述
+
+## 3. 关键路径 (Critical Paths)
+*   [启动流程](flows/startup.md)
+*   [核心业务流程 1 (e.g. Write)](flows/write_path.md)
+*   [核心业务流程 2 (e.g. Read)](flows/read_path.md)
+
+## 4. 模块分析 (Modules)
+*   [模块 A](modules/module_a.md)
+*   [模块 B](modules/module_b.md)
+
+## 5. 重点类/结构体 (Key Structures)
+*   `StructName`: 作用及生命周期
+
+## 6. 思考与重构 (Reflections)
+*   如果用 Rust 重写，这里怎么设计？
+*   这个设计模式的优缺点是什么？
