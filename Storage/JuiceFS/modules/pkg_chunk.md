@@ -514,7 +514,7 @@ impl<T: Clone> Singleflight<T> {
 ## 待深入研究
 - [x] 数据切片架构：已完成分析
 - [x] Singleflight 机制：已完成分析
-- [ ] 预读算法：`prefetch.go` 中的窗口滑动策略
-- [ ] 缓存淘汰：`cache_eviction.go` 中的 LRU 变体
-- [ ] Writeback 模式：异步上传和故障恢复
-- [ ] 分片上传：大文件的 Multipart Upload 策略
+- [x] 预读算法：已完成分析 (详见 [algorithms.md](../algorithms.md#algorithm-5-预读算法-prefetcher-worker-pool))
+- [x] 缓存淘汰：已完成分析 (详见 [algorithms.md](../algorithms.md#algorithm-4-缓存淘汰策略))
+- [x] Writeback 模式：已完成分析 (详见 [algorithms.md](../algorithms.md#algorithm-6-writeback-异步上传))
+- [x] 分片上传：已完成分析 (详见 [algorithms.md](../algorithms.md#algorithm-7-分片上传-multipart-upload))
