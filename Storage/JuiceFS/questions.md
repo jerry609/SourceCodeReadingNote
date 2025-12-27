@@ -3,8 +3,7 @@
 ## 待解决
 - [ ] Redis 事务保证：`WATCH` + `MULTI` 如何在分布式环境下保证元数据一致性？
 - [ ] TiKV 后端的 MVCC 特性如何被 JuiceFS 利用？
-- [ ] Writeback 模式下，后台上传失败后的恢复机制？
-- [ ] 如何实现跨客户端的缓存一致性？
+- [ ] 如何实现跨客户端的缓存一致性（非 Redis Client Tracking 场景）？
 
 ## 已解决
 
@@ -188,3 +187,226 @@ chunks/{slice_id%256 (hex)}/{slice_id/1000000}/{slice_id}_{block_index}_{block_s
 ```
 
 *关联代码*: `pkg/meta/interface.go:178-235`
+
+---
+
+### Q11: Writeback 模式下上传失败如何恢复？
+**A:** JuiceFS 通过 staging 目录实现故障恢复：
+
+1. **写入时**: 数据先写入本地 staging 目录，立即返回成功
+2. **后台上传**: 异步上传到对象存储
+3. **失败处理**: 上传失败的文件加入 `delayedStaging` 队列，定期重试
+4. **重启恢复**: 客户端启动时扫描 staging 目录，重新上传未完成的文件
+
+```go
+// pkg/chunk/cached_store.go:420-458
+if s.writeback && blen < s.store.conf.WritebackThresholdSize {
+    stagingPath, err := s.store.bcache.stage(key, block.Data)
+    if err == nil {
+        s.errors <- nil  // 立即返回成功
+        s.store.addDelayedStaging(key, stagingPath, time.Now(), false)
+        return
+    }
+}
+```
+
+---
+
+### Q12: JuiceFS 支持哪些缓存淘汰策略？
+**A:** 三种策略，通过 `--cache-eviction` 配置：
+
+| 策略 | 数据结构 | 淘汰复杂度 | 适用场景 |
+|:-----|:---------|:-----------|:---------|
+| `none` | HashMap | N/A | 缓存永不过期 |
+| `2-random` | HashMap | O(1) | 内存敏感，随机采样 |
+| `lru` | HashMap + MinHeap | O(log n) | 热点数据明显 |
+
+**2-random 算法**: 每遍历 2 个缓存项，选择较旧的一个淘汰（类似 Redis 的近似 LRU）。
+
+*关联代码*: `pkg/chunk/cache_eviction.go:54-71`
+
+---
+
+### Q13: 预读 (Prefetch) 是如何实现的？
+**A:** 使用 Worker Pool + Channel + Map 实现：
+
+```go
+// pkg/chunk/prefetch.go:23-63
+type prefetcher struct {
+    pending chan string       // 任务队列（buffer=10）
+    busy    map[string]bool   // 去重：正在处理的 key
+    op      func(key string)  // 实际预读函数
+}
+```
+
+**关键设计**:
+- **并发限制**: 固定数量的 worker goroutine
+- **去重**: `busy` map 防止重复预读同一块
+- **非阻塞**: channel 满时直接丢弃任务
+
+**触发时机**: 成功读取一个块后，触发下一个块的预读 (`cached_store.go:743`)
+
+---
+
+### Q14: FUSE writeback_cache 模式下为什么 O_WRONLY 也需要 reader？
+**A:** 这是 FUSE 内核缓存的特性决定的：
+
+在 `writeback_cache` 模式下，内核会缓存写入数据到 page cache。当需要对齐页面时（如部分页写入），内核可能会对只写打开的文件发起读请求。
+
+```go
+// pkg/vfs/handle.go:245-249
+case syscall.O_WRONLY: // FUSE writeback_cache mode need reader even for WRONLY
+    fallthrough
+case syscall.O_RDWR:
+    h.reader = v.reader.Open(inode, length)
+    h.writer = v.writer.Open(inode, length)
+```
+
+如果不创建 reader，内核的读请求会失败，导致写入失败。
+
+---
+
+### Q15: JuiceFS 如何通知内核使缓存失效？
+**A:** 通过 FUSE 的 `EntryNotify` 接口（仅 Linux）：
+
+```go
+// pkg/fuse/fuse.go:533-535
+v.InvalidateEntry = func(parent Ino, name string) syscall.Errno {
+    return syscall.Errno(fssrv.EntryNotify(uint64(parent), name))
+}
+```
+
+**三类失效**:
+| 类型 | 触发时机 | 作用 |
+|:-----|:---------|:-----|
+| Entry | 删除/重命名后 | 使目录项缓存失效 |
+| Attr | 写入/truncate 后 | 使属性缓存失效 |
+| Chunk | 写入/compact 后 | 使数据缓存失效 |
+
+---
+
+### Q16: Chunk Compact 是如何触发的？
+**A:** 两个触发点：
+
+**读取时** (`base.go:1928`):
+```go
+if len(ss) >= 5 || len(*slices) >= 5 {
+    go m.compactChunk(inode, indx, false, false)  // 异步
+}
+```
+
+**写入时** (`base.go:1982`):
+```go
+if numSlices % 100 == 99 || numSlices > 350 {
+    if numSlices < maxSlices {
+        go m.compactChunk(...)  // 异步
+    } else {
+        m.compactChunk(...)     // 同步阻塞
+    }
+}
+```
+
+**去重**: 使用 `compacting` map 防止同一 chunk 被重复压缩。
+
+---
+
+### Q17: Compact 时如何决定跳过哪些 slice？
+**A:** `skipSome` 函数实现智能跳过：
+
+```go
+// pkg/meta/slice.go:183-210
+func skipSome(chunk []*slice) int {
+    for skipped < len(chunk) {
+        first := chunk[skipped]
+        // 跳过条件：slice > 1MB 且占总大小 > 20%
+        if first.len < (1<<20) || first.len*5 < size {
+            break  // 太小，需要压缩
+        }
+        skipped++
+    }
+    return skipped
+}
+```
+
+**原理**: 大 slice 已经是完整的数据块，压缩收益小；小 slice 需要合并以减少碎片。
+
+---
+
+### Q18: 分片上传 (Multipart Upload) 的分片大小如何选择？
+**A:** 动态计算：
+
+```go
+// pkg/sync/sync.go:661-671
+func choosePartSize(upload *MultipartUpload, size int64) int64 {
+    partSize := int64(upload.MinPartSize)  // 默认 5MB
+    // 如果分片太小导致数量超限，自动调大
+    if size > partSize * int64(upload.MaxCount) {
+        partSize = size / int64(upload.MaxCount)
+        partSize = ((partSize-1)>>20 + 1) << 20  // 向上对齐到 MB
+    }
+    return partSize
+}
+```
+
+| 文件大小 | 分片大小 | 分片数量 |
+|:---------|:---------|:---------|
+| < 50GB | 5MB | < 10000 |
+| 50GB - 500GB | 5MB - 50MB | ~10000 |
+| > 500GB | 动态调整 | 10000 |
+
+---
+
+### Q19: Slice 重叠是如何处理的？
+**A:** 使用二叉树 + `cut` 算法：
+
+```go
+// pkg/meta/slice.go:55-79
+func (s *slice) cut(pos uint32) (left, right *slice) {
+    if pos <= s.pos {
+        // 在左边切
+        left, s.left = s.left.cut(pos)
+        return left, s
+    } else if pos < s.pos + s.len {
+        // 在中间切
+        right = newSlice(pos, s.id, s.size, s.off+l, s.len-l)
+        s.len = l
+        return s, right
+    } else {
+        // 在右边切
+        s.right, right = s.right.cut(pos)
+        return s, right
+    }
+}
+```
+
+每个新写入的 slice 会 "切开" 已有的 slice，确保没有重叠。最终通过中序遍历得到有序的 slice 列表。
+
+---
+
+### Q20: Page Pool 是如何实现内存复用的？
+**A:** 使用带缓冲的 channel 作为对象池：
+
+```go
+// pkg/chunk/page.go:38-55
+var pagePool = make(chan *Page, 128)
+
+func allocPage() *Page {
+    select {
+    case p := <-pagePool:
+        return p
+    default:
+        return &Page{Data: make([]byte, pageSize)}
+    }
+}
+
+func freePage(p *Page) {
+    select {
+    case pagePool <- p:
+    default:
+        // 池满，让 GC 回收
+    }
+}
+```
+
+**优势**: 避免频繁 GC，减少内存分配开销。
+**池大小**: 128 个 Page × 64KB = 8MB 内存。
