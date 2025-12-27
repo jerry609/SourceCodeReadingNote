@@ -417,6 +417,195 @@ impl SliceState {
 ## 待深入研究
 - [x] 句柄管理机制：已完成分析
 - [x] 热升级状态恢复：已完成分析
-- [ ] WriterBack 模式：FUSE 的 writeback_cache 如何与 JuiceFS 配合
-- [ ] 内核缓存失效：如何通知内核使缓存失效
-- [ ] Compact 逻辑：如何触发和执行 Chunk 压缩
+- [x] WriterBack 模式：已完成分析
+- [x] 内核缓存失效：已完成分析
+- [x] Compact 逻辑：已完成分析
+
+---
+
+## FUSE writeback_cache 模式
+
+### 原理
+FUSE 的 `writeback_cache` 选项启用内核级写缓冲。内核会将写操作缓存在 page cache 中，而不是立即发送给用户态文件系统。
+
+### 配置方式
+```bash
+juicefs mount -o writeback_cache meta://... /mnt/jfs
+```
+
+### JuiceFS 适配
+```go
+// pkg/fuse/fuse.go:499-500
+} else if n == "writeback_cache" {
+    opt.EnableWriteback = true
+}
+```
+
+### 关键设计：WRONLY 也需要 reader
+```go
+// pkg/vfs/handle.go:245-249
+case syscall.O_WRONLY: // FUSE writeback_cache mode need reader even for WRONLY
+    fallthrough
+case syscall.O_RDWR:
+    h.reader = v.reader.Open(inode, length)
+    h.writer = v.writer.Open(inode, length)
+```
+
+**原因**: 在 writeback_cache 模式下，内核可能对只写打开的文件发起读请求（用于 page cache 对齐），因此 JuiceFS 必须为 O_WRONLY 也创建 reader。
+
+### 数据失效处理
+```go
+// pkg/vfs/vfs.go:863
+v.reader.Invalidate(ino, off, size)  // 写入后使读缓存失效
+```
+
+---
+
+## 内核缓存失效机制
+
+### 目录项失效 (Entry Invalidation)
+JuiceFS 使用 FUSE 的 `EntryNotify` 接口通知内核使目录项缓存失效：
+
+```go
+// pkg/fuse/fuse.go:533-535 (仅 Linux)
+if runtime.GOOS == "linux" {
+    v.InvalidateEntry = func(parent Ino, name string) syscall.Errno {
+        return syscall.Errno(fssrv.EntryNotify(uint64(parent), name))
+    }
+}
+```
+
+### 使用场景
+```go
+// pkg/vfs/internal.go:324-327 (删除操作后)
+if st == 0 && v.InvalidateEntry != nil {
+    if st := v.InvalidateEntry(inode, name); st != 0 {
+        logger.Warnf("Invalidate entry %d/%s: %s", inode, name, st)
+    }
+}
+```
+
+### Chunk 缓存失效
+```go
+// pkg/vfs/vfs.go:864
+v.invalidateAttr(ino)  // 使属性缓存失效
+
+// pkg/meta/base.go:1972
+m.of.InvalidateChunk(inode, indx)  // Truncate 后使 Chunk 缓存失效
+```
+
+### 失效类型总结
+| 类型 | 触发时机 | 接口 |
+|:-----|:---------|:-----|
+| Entry | 删除/重命名后 | `fssrv.EntryNotify` |
+| Attr | 写入/truncate 后 | `invalidateAttr` |
+| Chunk | 写入/truncate/compact 后 | `InvalidateChunk` |
+
+---
+
+## Chunk Compact 逻辑
+
+### 触发条件
+```go
+// pkg/meta/base.go:1928-1929 (读取时)
+if !m.conf.ReadOnly && (len(ss) >= 5 || len(*slices) >= 5) {
+    go m.compactChunk(inode, indx, false, false)
+}
+
+// pkg/meta/base.go:1982-1987 (写入时)
+if numSlices%100 == 99 || numSlices > 350 {
+    if numSlices < maxSlices {
+        go m.compactChunk(inode, indx, false, false)  // 异步
+    } else {
+        m.compactChunk(inode, indx, true, false)      // 同步阻塞
+    }
+}
+```
+
+### 去重机制
+```go
+// pkg/meta/base.go:2578-2602
+func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool) {
+    k := uint64(inode) + (uint64(indx) << 40)  // 唯一 key
+    m.Lock()
+    if once || force {
+        for m.compacting[k] {  // 等待已有压缩完成
+            m.Unlock()
+            time.Sleep(time.Millisecond * 10)
+            m.Lock()
+        }
+    } else if len(m.compacting) > 10 || m.compacting[k] {
+        m.Unlock()
+        return  // 跳过：已在压缩或压缩任务过多
+    }
+    m.compacting[k] = true
+    // ...
+}
+```
+
+### 压缩流程
+```mermaid
+graph TD
+    A[compactChunk] --> B[读取当前 slices]
+    B --> C{len >= 2 ?}
+    C -- No --> D[return]
+    C -- Yes --> E[skipSome: 跳过大 slice]
+    E --> F[compactChunk: 合并小 slice]
+    F --> G[NewSlice: 分配新 slice ID]
+    G --> H[newMsg CompactChunk]
+    H --> I[doCompactChunk: 原子替换]
+    I --> J[InvalidateChunk: 清除缓存]
+```
+
+### skipSome 算法
+跳过不需要压缩的大 slice：
+```go
+// pkg/meta/slice.go:183-210
+func skipSome(chunk []*slice) int {
+    var skipped int
+    for skipped < len(chunk) {
+        first := chunk[skipped]
+        // 条件：slice 足够大 (>1MB) 且占总大小的 20% 以上
+        if first.len < (1<<20) || first.len*5 < size {
+            break
+        }
+        // 确保是第一个有效 slice
+        if !isFirst(pos, c[0]) {
+            break
+        }
+        skipped++
+    }
+    return skipped
+}
+```
+
+### Slice 合并 (buildSlice)
+使用二叉树结构处理 slice 重叠：
+```go
+// pkg/meta/slice.go:134-155
+func buildSlice(ss []*slice) []Slice {
+    var root *slice
+    for i := range ss {
+        s := new(slice)
+        *s = *ss[i]
+        // cut: 处理重叠部分
+        s.left, right = root.cut(s.pos)
+        _, s.right = right.cut(s.pos + s.len)
+        root = s
+    }
+    // 中序遍历生成最终 slice 列表
+    root.visit(func(s *slice) {
+        chunk = append(chunk, Slice{Id: s.id, Size: s.size, Off: s.off, Len: s.len})
+    })
+    return chunk
+}
+```
+
+### 手动触发
+```bash
+# 压缩单个文件
+juicefs compact /mnt/jfs/path/to/file
+
+# 压缩整个文件系统
+juicefs gc --compact meta://...
+```
