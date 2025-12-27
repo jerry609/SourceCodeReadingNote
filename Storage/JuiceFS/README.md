@@ -103,3 +103,6 @@ JuiceFS 采用元数据与数据完全分离的架构：
 
 ## 8. 实战练习 (Exercises)
 见 [exercises/TASKS.md](exercises/TASKS.md) - Rust 重写任务清单。
+
+## 11. 面试题库 (Interview Questions)
+见 [interview_questions.md](interview_questions.md) - 100 道面试题，覆盖架构、实现、算法、运维等维度。
