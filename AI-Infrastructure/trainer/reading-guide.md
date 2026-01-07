@@ -15,6 +15,10 @@
 
 入口文件（控制面启动）：`cmd/trainer-controller-manager/main.go`
 
+框架/用途一句话补充：
+- Torch/MPI 有“专用插件”支持（分布式 env、hostfile/SSH、gang 调度等）
+- 其他框架（例如 JAX/TensorFlow/自定义训练器）通常通过 runtime 模板 + 镜像/命令运行（走 PlainML/通用路径）
+
 ---
 
 ## 1. 架构骨架（5 分钟）
@@ -30,6 +34,11 @@
 - `pkg/runtime/`：运行时抽象（把 runtime 模板 + TrainJob 合成最终对象）
 - `pkg/runtime/framework/`：插件框架（按阶段执行策略/构建/校验/扩展 watch）
 - `manifests/` / `charts/`：部署与 CRD 生成物
+
+Controllers 一览（先记住“各自看什么/改什么”即可）：
+- `pkg/controller/trainjob_controller.go`：主闭环（生成/Apply 子资源 + 回写 TrainJob status）
+- `pkg/controller/trainingruntime_controller.go`：TrainingRuntime 防误删（finalizer）+ 关联 TrainJob 变化触发
+- `pkg/controller/clustertrainingruntime_controller.go`：ClusterTrainingRuntime 防误删（finalizer）+ 关联 TrainJob 变化触发
 
 ---
 
@@ -147,4 +156,3 @@ kubectl apply TrainJob
 3) 改一行（例如：env/numNodes 的注入），看 JobSet spec 是否变化
 
 这样你会非常快地把“文字理解”变成“可操作理解”。
-
