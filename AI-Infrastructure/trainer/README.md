@@ -214,7 +214,14 @@ type TrainJobStatusPlugin interface {
 
 *   [问题列表](questions.md)
 
-## 11. 思考与重构 (Reflections)
+## 11. 系统设计哲学 (System Design Philosophy)
+
+*   [不变量分析](invariants.md): TrainJob-JobSet 映射、保留环境变量、不可变 Secret
+*   [控制面与数据面分离](control-data-plane.md): Controller 决策 vs Worker 执行
+*   [闭环设计](reconcile-loops.md): Reconcile Loop 模式、SSA 幂等性
+*   [扩展点设计](extension-points.md): Plugin Framework 的扩展机制
+
+## 12. 思考与重构 (Reflections)
 
 ### 插件化架构的优势
 
