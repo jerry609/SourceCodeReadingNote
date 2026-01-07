@@ -36,6 +36,15 @@
 ## 9. 疑问与解答 (Q&A)
 *   [问题列表](questions.md)
 
-## 10. 思考与重构 (Reflections)
+## 10. 系统设计哲学 (System Design Philosophy)
+*   [不变量分析](invariants.md): 识别系统必须维护的核心不变量
+*   [控制面与数据面分离](control-data-plane.md): 决策与执行的边界划分
+*   [闭环设计](reconcile-loops.md): Reconcile Loop 模式分析
+*   [扩展点设计](extension-points.md): 可插拔架构与插件机制
+*   [演进策略](evolution-strategy.md): 版本管理、特性开关、迁移策略
+*   [反模式识别](anti-patterns.md): 识别并避免常见反模式
+*   [真相之源分析](sot-analysis.md): 数据权威性与一致性保证
+
+## 11. 思考与重构 (Reflections)
 *   如果用 Rust 重写，这里怎么设计？
 *   这个设计模式的优缺点是什么？
