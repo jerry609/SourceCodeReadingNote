@@ -3,9 +3,12 @@
 ## 1. 项目概览 (Overview)
 
 *   **类型**: Kubernetes-native 分布式机器学习训练框架
+*   **本质**: Kubernetes Operator（controller-runtime），通过 Reconcile + SSA 收敛
 *   **核心语言**: Go (Controller), Python (SDK)
 *   **一句话描述**: 在 Kubernetes 上实现 LLM 微调和分布式 ML 模型训练的云原生解决方案
 *   **阅读目标**: 理解 Kubernetes Operator 设计模式、插件化架构、分布式训练编排
+
+快速阅读路线：[`AI-Infrastructure/trainer/reading-guide.md`](reading-guide.md)
 
 ## 2. 核心架构 (Architecture)
 
@@ -116,6 +119,7 @@ spec:
 *   [启动流程](flows/startup.md): Controller Manager 启动和初始化
 *   [TrainJob 创建流程](flows/trainjob_reconcile.md): 从 TrainJob 到 JobSet 的转换
 *   [训练执行流程](flows/training_execution.md): Pod 创建和分布式训练协调
+*   [快速建立心智模型](reading-guide.md): 30 秒定位 + 10 分钟数据流
 
 ## 5. 模块分析 (Modules)
 

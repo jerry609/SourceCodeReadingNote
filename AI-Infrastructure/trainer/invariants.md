@@ -29,14 +29,19 @@
 ### 如何保证？
 
 ```go
-// pkg/runtime/framework/plugins/jobset/jobset.go:238-245
-func (j *JobSet) buildJobSetApplyConfiguration(info *runtime.Info, trainJob *trainer.TrainJob) *jobsetv1alpha2ac.JobSetApplyConfiguration {
-    return jobsetv1alpha2ac.JobSet(trainJob.Name, trainJob.Namespace).
-        WithLabels(info.Labels).
-        WithAnnotations(info.Annotations).
-        // OwnerReference 保证级联删除
-        WithOwnerReferences(ownerRef)
-}
+// pkg/runtime/framework/plugins/jobset/jobset.go:Build（节选）
+jobSet := jobsetv1alpha2ac.JobSet(trainJob.Name, trainJob.Namespace).
+    WithLabels(maps.Clone(info.Labels)).
+    WithAnnotations(maps.Clone(info.Annotations)).
+    WithSpec(jobSetSpec).
+    // OwnerReference 保证级联删除
+    WithOwnerReferences(metav1ac.OwnerReference().
+        WithAPIVersion(trainer.GroupVersion.String()).
+        WithKind(trainer.TrainJobKind).
+        WithName(trainJob.Name).
+        WithUID(trainJob.UID).
+        WithController(true).
+        WithBlockOwnerDeletion(true))
 ```
 
 **关键机制**:
@@ -54,7 +59,7 @@ func (j *JobSet) buildJobSetApplyConfiguration(info *runtime.Info, trainJob *tra
 1. 孤儿 JobSet 会被 GC 清理（OwnerReference 机制）
 2. 重复的 JobSet 创建会失败（名称冲突）
 
-*关联代码位置*: `pkg/runtime/framework/plugins/jobset/jobset.go:238-245`
+*关联代码位置*: `pkg/runtime/framework/plugins/jobset/jobset.go`
 
 ---
 
@@ -74,8 +79,8 @@ func (j *JobSet) buildJobSetApplyConfiguration(info *runtime.Info, trainJob *tra
 ### 如何保证？
 
 ```go
-// pkg/runtime/framework/plugins/torch/torch.go:74-88
-func (t *Torch) Validate(oldObj, newObj *trainer.TrainJob) (admission.Warnings, field.ErrorList) {
+// pkg/runtime/framework/plugins/torch/torch.go:Validate（节选）
+func (t *Torch) Validate(_ context.Context, runtimeInfo *runtime.Info, _, newObj *trainer.TrainJob) (admission.Warnings, field.ErrorList) {
     torchEnvs := sets.New[string]()
     for _, env := range newObj.Spec.Trainer.Env {
         if constants.TorchRunReservedEnvNames.Has(env.Name) {
@@ -107,7 +112,9 @@ func (t *Torch) Validate(oldObj, newObj *trainer.TrainJob) (admission.Warnings, 
 
 ### 描述
 
-TrainJob 的 `managedBy`、`podSpecOverrides` 等字段只能在 `suspend=true` 且 JobSet 无活跃 Pod 时修改。
+TrainJob 的 `podTemplateOverrides` 只能在 `suspend=true` 且 JobSet 无活跃 Pod 时修改。
+
+补充：`runtimeRef` 与 `managedBy` 在 CRD 层面标记为 **不可变**（XValidation），与 `suspend` 无关。
 
 ### 为什么必须成立？
 
@@ -164,14 +171,14 @@ if changed {
 ### 如何保证？
 
 ```go
-// pkg/runtime/framework/plugins/mpi/mpi.go:286-293
+// pkg/runtime/framework/plugins/mpi/mpi.go:buildSSHAuthSecret（节选）
 return corev1ac.Secret(sshAuthSecretName(trainJob.Name), trainJob.Namespace).
     WithType(corev1.SecretTypeSSHAuth).
     WithData(map[string][]byte{
-        corev1.SSHAuthPrivateKey: pemEncoded,
-        "authorized_keys":        authorizedKeys,
+        corev1.SSHAuthPrivateKey:  privatePEM,
+        constants.MPISSHPublicKey: ssh.MarshalAuthorizedKey(publicKey),
     }).
-    WithImmutable(true).  // 关键：不可变
+    WithImmutable(true). // 关键：不可变
     WithOwnerReferences(ownerRef), nil
 ```
 
@@ -203,24 +210,17 @@ TrainJob 引用的 Runtime（TrainingRuntime 或 ClusterTrainingRuntime）必须
 ### 如何保证？
 
 ```go
-// pkg/runtime/core/trainingruntime.go:47-55
-func (r *TrainingRuntime) GetRuntimeSpec(
-    ctx context.Context, trainJob *trainer.TrainJob,
-) (*trainer.TrainingRuntimeSpec, error) {
-    var trainingRuntime trainer.TrainingRuntime
-    if err := r.client.Get(ctx, types.NamespacedName{
-        Namespace: trainJob.Namespace,  // 命名空间级
-        Name:      *trainJob.Spec.RuntimeRef.Name,
-    }, &trainingRuntime); err != nil {
-        return nil, err
-    }
-    return &trainingRuntime.Spec, nil
-}
+// pkg/controller/trainjob_controller.go:Reconcile（节选）
+runtimeRefGK := runtime.RuntimeRefToRuntimeRegistryKey(trainJob.Spec.RuntimeRef)
+runtimeImpl := r.runtimes[runtimeRefGK]
+
+// runtime.NewObjects() 内部会 client.Get 对应的 (Cluster)TrainingRuntime
+objects, err := runtimeImpl.NewObjects(ctx, &trainJob)
 ```
 
-**优先级规则**:
-- TrainingRuntime（命名空间级）优先于 ClusterTrainingRuntime（集群级）
-- 通过 `RuntimeRef.Kind` 显式指定
+**选择规则**：
+- 由 `spec.runtimeRef.kind` 显式指定引用类型（默认 `ClusterTrainingRuntime`）
+- `spec.runtimeRef` 字段本身不可变，因此同一个 TrainJob 的“runtime 身份”稳定
 
 ### 破坏场景
 

@@ -47,28 +47,43 @@ type Info struct {
     RuntimePolicy RuntimePolicy
 
     // 调度器配置
-    Scheduler Scheduler
+    Scheduler *Scheduler
 
     // 模板规格
     TemplateSpec TemplateSpec
 }
 
 type RuntimePolicy struct {
-    *trainer.MLPolicy           // ML 策略 (Torch/MPI)
-    *trainer.PodGroupPolicy     // PodGroup 策略 (Coscheduling/Volcano)
+    MLPolicySource *trainer.MLPolicySource
+    PodGroupPolicy *trainer.PodGroupPolicy
 }
 
 type TemplateSpec struct {
-    apply any           // JobSet Apply Configuration
-    PodSets []PodSet    // Pod 集合信息
+    ObjApply any        // (Cluster)TrainingRuntime.Template 对应的 ApplyConfiguration
+    PodSets   []PodSet  // 从 ObjApply 抽取出的 PodSpec 抽象
 }
 
 type PodSet struct {
-    Name       string
-    Count      *int32
-    Endpoints  iter.Seq[string]    // Pod 端点迭代器
-    Volumes    []corev1ac.VolumeApplyConfiguration
-    Containers []Container
+    Name            string
+    Ancestor        *string
+    Count           *int32
+    InitContainers  []Container
+    Containers      []Container
+    Volumes         []corev1ac.VolumeApplyConfiguration
+    Endpoints       iter.Seq[string] // Pod 端点迭代器（由 PodNetwork 插件填充）
+    SinglePodRequests corev1.ResourceList // 资源请求（用于 PodGroup 聚合）
+}
+
+type Container struct {
+    Name         string
+    Env          []corev1ac.EnvVarApplyConfiguration
+    Ports        []corev1ac.ContainerPortApplyConfiguration
+    VolumeMounts []corev1ac.VolumeMountApplyConfiguration
+}
+
+type Scheduler struct {
+    PodLabels      map[string]string
+    PodAnnotations map[string]string
 }
 ```
 
@@ -119,30 +134,19 @@ type PodSet struct {
 ### Runtime 注册表初始化
 
 ```go
-// pkg/runtime/core/registry.go
-func New(ctx context.Context, client client.Client, indexer client.FieldIndexer) (map[string]runtime.Runtime, error) {
-    // 创建插件框架
-    fwk, err := fwkcore.New(ctx, client, plugins.NewRegistry(), indexer)
-    if err != nil {
-        return nil, err
+// pkg/runtime/core/core.go:New（节选）
+registry := NewRuntimeRegistry()
+runtimes := make(map[string]runtime.Runtime, len(registry))
+for name, registrar := range registry {
+    // 处理依赖（ClusterTrainingRuntime 依赖 TrainingRuntime 先初始化）
+    for _, dep := range registrar.dependencies { /* ... */ }
+    if _, ok := runtimes[name]; !ok {
+        r, err := registrar.factory(ctx, client, indexer)
+        if err != nil { return nil, err }
+        runtimes[name] = r
     }
-
-    // 注册支持的 Runtime 类型
-    runtimes := map[string]runtime.Runtime{
-        // TrainingRuntime (命名空间级)
-        runtime.RuntimeRefToRuntimeRegistryKey(trainer.RuntimeRef{
-            APIGroup: ptr.To(trainer.GroupVersion.Group),
-            Kind:     ptr.To(trainer.TrainingRuntimeKind),
-        }): NewTrainingRuntime(client, fwk),
-
-        // ClusterTrainingRuntime (集群级)
-        runtime.RuntimeRefToRuntimeRegistryKey(trainer.RuntimeRef{
-            APIGroup: ptr.To(trainer.GroupVersion.Group),
-            Kind:     ptr.To(trainer.ClusterTrainingRuntimeKind),
-        }): NewClusterTrainingRuntime(client, fwk),
-    }
-    return runtimes, nil
 }
+return runtimes, nil
 ```
 
 ### NewObjects 核心流程
@@ -159,29 +163,14 @@ func (r *TrainingRuntime) NewObjects(ctx context.Context, trainJob *trainer.Trai
         return nil, err
     }
 
-    // 2. 构建 RuntimeInfo
-    info, err := r.RuntimeInfo(trainJob, &runtime.Spec.Template.Spec,
+    // 2. 构建 RuntimeInfo（内部会执行 MLPolicy/PodGroupPolicy/PodNetwork 三类插件）
+    info, err := r.RuntimeInfo(trainJob, runtime.Spec.Template,
         runtime.Spec.MLPolicy, runtime.Spec.PodGroupPolicy)
     if err != nil {
         return nil, err
     }
 
-    // 3. 运行 ML 策略插件 (Torch/MPI)
-    if err := r.framework.RunEnforceMLPolicyPlugins(info, trainJob); err != nil {
-        return nil, err
-    }
-
-    // 4. 运行 PodGroup 策略插件 (Coscheduling/Volcano)
-    if err := r.framework.RunEnforcePodGroupPolicyPlugins(info, trainJob); err != nil {
-        return nil, err
-    }
-
-    // 5. 运行 Pod 网络插件 (设置 Pod 端点)
-    if err := r.framework.RunPodNetworkPlugins(info, trainJob); err != nil {
-        return nil, err
-    }
-
-    // 6. 运行组件构建插件 (生成 JobSet, Secret, ConfigMap 等)
+    // 3. 运行组件构建插件 (生成 JobSet, PodGroup, Secret, ConfigMap 等)
     return r.framework.RunComponentBuilderPlugins(ctx, info, trainJob)
 }
 ```
@@ -189,45 +178,23 @@ func (r *TrainingRuntime) NewObjects(ctx context.Context, trainJob *trainer.Trai
 ### RuntimeInfo 构建
 
 ```go
-// pkg/runtime/core/core.go
-func (r *runtime) RuntimeInfo(
+// pkg/runtime/core/trainingruntime.go:RuntimeInfo（节选）
+func (r *TrainingRuntime) RuntimeInfo(
     trainJob *trainer.TrainJob,
     runtimeTemplateSpec any,
     mlPolicy *trainer.MLPolicy,
     podGroupPolicy *trainer.PodGroupPolicy,
 ) (*runtime.Info, error) {
-    info := &runtime.Info{
-        Labels:      make(map[string]string),
-        Annotations: make(map[string]string),
-        RuntimePolicy: runtime.RuntimePolicy{
-            MLPolicy:       mlPolicy.DeepCopy(),
-            PodGroupPolicy: podGroupPolicy.DeepCopy(),
-        },
-    }
+    jobSetTemplateSpec, ok := runtimeTemplateSpec.(trainer.JobSetTemplateSpec)
+    if !ok { return nil, fmt.Errorf("unsupported runtimeTemplateSpec") }
 
-    // 解析 JobSet 模板
-    jobSetSpec, ok := runtimeTemplateSpec.(*jobsetv1alpha2ac.JobSetSpecApplyConfiguration)
-    if !ok {
-        return nil, fmt.Errorf("unsupported template spec type")
-    }
+    info, err := r.newRuntimeInfo(trainJob, jobSetTemplateSpec, mlPolicy, podGroupPolicy)
+    if err != nil { return nil, err }
 
-    // 构建 PodSet 列表
-    info.TemplateSpec.apply = jobSetSpec
-    for _, rJob := range jobSetSpec.ReplicatedJobs {
-        podSet := runtime.PodSet{
-            Name:  *rJob.Name,
-            Count: rJob.Template.Spec.Parallelism,
-        }
-        // 解析容器
-        for _, c := range rJob.Template.Spec.Template.Spec.Containers {
-            podSet.Containers = append(podSet.Containers, runtime.Container{
-                Name: *c.Name,
-                Env:  c.Env,
-            })
-        }
-        info.TemplateSpec.PodSets = append(info.TemplateSpec.PodSets, podSet)
-    }
-
+    // 固定阶段的插件管线
+    if err = r.framework.RunEnforceMLPolicyPlugins(info, trainJob); err != nil { return nil, err }
+    if err = r.framework.RunEnforcePodGroupPolicyPlugins(info, trainJob); err != nil { return nil, err }
+    if err = r.framework.RunPodNetworkPlugins(info, trainJob); err != nil { return nil, err }
     return info, nil
 }
 ```
@@ -267,13 +234,16 @@ spec:
 
 ### 2. 插件链模式
 
-各插件按顺序执行，每个插件修改 `Info` 对象：
+各插件按“阶段”顺序执行，每个插件修改 `Info` 对象：
 
 ```
-EnforceMLPolicy (Torch) -> EnforceMLPolicy (MPI) ->
-EnforcePodGroupPolicy (Coscheduling) -> PodNetwork (JobSet) ->
-ComponentBuilder (JobSet) -> ComponentBuilder (MPI)
+EnforceMLPolicy (PlainML/Torch/MPI) ->
+EnforcePodGroupPolicy (CoScheduling/Volcano) ->
+PodNetwork (JobSet) ->
+ComponentBuilder (JobSet/MPI/CoScheduling/Volcano)
 ```
+
+备注：同一阶段内的插件执行顺序来自 registry 的遍历（Go map 无序），因此插件应避免顺序依赖，通常通过 nil-check/ancestor-check 做互斥与隔离。
 
 ### 3. Apply Configuration 模式
 

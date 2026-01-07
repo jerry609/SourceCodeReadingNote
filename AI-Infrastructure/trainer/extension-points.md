@@ -1,440 +1,223 @@
 # 扩展点设计 (Extension Points)
 
-> 把变化安置在"插件边缘"，把稳定留在"内核中心"。
+> 把变化安置在“插件边缘”，把稳定留在“内核中心”。
+
+Trainer 的扩展点主要围绕两件事：
+1) **把 (Cluster)TrainingRuntime 的模板变成可执行的 K8s 资源**（JobSet/PodGroup/Secret/ConfigMap…）
+2) **把 ML/调度的差异收敛在插件里**（Torch/MPI、coscheduling/volcano 等）
 
 ## 设计原则
 
-1. **识别变化**: ML 框架多样（Torch/MPI/DeepSpeed）、调度器多样（默认/Volcano/Coscheduling）
-2. **封装变化**: 做成可插拔的 Plugin
-3. **保护核心**: Controller 和 Runtime 接口保持稳定
+1. **识别变化**：ML 策略（Torch/MPI/无策略）、Gang 调度策略（Coscheduling/Volcano/无）
+2. **封装变化**：把变化点做成可插拔的 Plugin，核心只关心“执行哪个阶段”
+3. **保护核心**：Controller + Runtime 接口尽量稳定；插件通过 `runtime.Info` 交换数据
 
 ---
 
-## 架构图
+## 核心调用链（把扩展点放进时序里）
 
 ```
-                    ┌─────────────────────────────────────┐
-                    │         Core (稳定)                 │
-                    │  ┌─────────────────────────────────┐│
-                    │  │    TrainJob Controller          ││
-                    │  │    Runtime Interface            ││
-                    │  │    Framework Interface          ││
-                    │  └─────────────────────────────────┘│
-                    └─────────────────────────────────────┘
-                                     │
-         ┌───────────────────────────┼───────────────────────────┐
-         ▼                           ▼                           ▼
-┌─────────────────┐       ┌─────────────────┐       ┌─────────────────┐
-│  MLPolicy       │       │  Customization  │       │  ComponentBuilder│
-│  Plugins        │       │  Plugins        │       │  Plugins        │
-│  ┌───────────┐  │       │  ┌───────────┐  │       │  ┌───────────┐  │
-│  │   Torch   │  │       │  │  JobSet   │  │       │  │  JobSet   │  │
-│  │   MPI     │  │       │  │Coscheduling│ │       │  │  Builder  │  │
-│  │ DeepSpeed │  │       │  │  Volcano  │  │       │  └───────────┘  │
-│  └───────────┘  │       │  └───────────┘  │       └─────────────────┘
-└─────────────────┘       └─────────────────┘
+TrainJob Controller
+  └─ runtime.NewObjects()
+       ├─ runtime.RuntimeInfo()
+       │    ├─ EnforceMLPolicy plugins
+       │    ├─ EnforcePodGroupPolicy plugins
+       │    └─ PodNetwork plugins
+       └─ ComponentBuilder plugins   -> []ApplyConfiguration
+
+TrainJob Webhook
+  └─ runtime.ValidateObjects()
+       └─ CustomValidation plugins   -> warnings + field.ErrorList
+
+TrainJob Status
+  └─ runtime.TrainJobStatus()
+       └─ TrainJobStatus plugin      -> TrainJobStatus
+
+Watches 扩展
+  └─ runtime.EventHandlerRegistrars()
+       └─ WatchExtension plugins     -> []ReconcilerBuilder
 ```
 
 ---
 
-## 扩展点清单
+## 扩展点清单（以接口为准）
 
-| 扩展点 | 类型 | 变化频率 | 隔离机制 | 源码位置 |
-|:-------|:-----|:---------|:---------|:---------|
-| EnforceMLPolicy | Plugin | 中 | 接口契约 | `pkg/runtime/framework/interface.go` |
-| EnforceCustomization | Plugin | 中 | 接口契约 | `pkg/runtime/framework/interface.go` |
-| ComponentBuilder | Plugin | 低 | 接口契约 | `pkg/runtime/framework/interface.go` |
-| Webhook (Validate) | Plugin | 中 | 接口契约 | `pkg/runtime/framework/interface.go` |
-| Runtime | Interface | 低 | 接口契约 | `pkg/runtime/interface.go` |
+接口定义在：`pkg/runtime/framework/interface.go`，运行时接口在：`pkg/runtime/interface.go`。
+
+| 扩展点（接口） | 解决的问题 | 典型实现 |
+|:--|:--|:--|
+| `EnforceMLPolicyPlugin` | 注入 ML 运行所需的 env/volume/count 等 | PlainML/Torch/MPI |
+| `EnforcePodGroupPolicyPlugin` | 注入 Gang 调度所需的 Pod labels 等 | CoScheduling/Volcano |
+| `PodNetworkPlugin` | 识别 Pod endpoints（用于 rendezvous/hostfile 等） | JobSet |
+| `ComponentBuilderPlugin` | 构建最终要 Apply 的对象 | JobSet/MPI/CoScheduling/Volcano |
+| `TrainJobStatusPlugin` | 从底层工作负载聚合 TrainJob 状态 | JobSet |
+| `CustomValidationPlugin` | admission 阶段的自定义校验 | Torch/MPI/JobSet |
+| `WatchExtensionPlugin` | 给 TrainJob controller 追加 watches | JobSet/MPI/CoScheduling/Volcano |
 
 ---
 
-## Extension Point 1: EnforceMLPolicy
+## Extension Point 1：`EnforceMLPolicyPlugin`
 
 ### 设计意图
 
-不同 ML 框架（PyTorch、MPI、DeepSpeed）需要不同的配置注入方式：
-- PyTorch: 设置 `torchrun` 命令和 `PET_*` 环境变量
-- MPI: 生成 SSH 密钥、创建 hostfile
-- DeepSpeed: 配置 DeepSpeed launcher
+把“如何跑起来”的差异收敛在一处：
+- Torch：写入 `PET_*` 分布式 env；TorchTune 会补齐/校验命令参数
+- MPI：调整 node 数、写入 slots、挂载 SSH/hostfile、注入 OpenMPI env
+- PlainML：当 runtime 未配置 Torch/MPI 时，做最基础的 `numNodes/env` 透传
 
-### 扩展类型
-
-- [x] **接口扩展**: 实现 `EnforceMLPolicyPlugin` 接口
-- [ ] 插件扩展: 动态加载
-- [ ] Webhook 扩展
-- [ ] 配置扩展
-
-### 接口定义
+### 接口（精简版）
 
 ```go
-// pkg/runtime/framework/interface.go:40-48
 type EnforceMLPolicyPlugin interface {
-    // Name 返回插件名称
-    Name() string
-
-    // EnforceMLPolicy 在 Info 上注入 ML 框架特定配置
-    EnforceMLPolicy(
-        info *runtime.Info,
-        trainJob *trainer.TrainJob,
-        runtimeSpec *trainer.TrainingRuntimeSpec,
-    ) *runtime.Info
+    Plugin
+    EnforceMLPolicy(info *runtime.Info, trainJob *trainer.TrainJob) error
 }
 ```
 
-### 注册机制
+### 调用位置
 
-```go
-// pkg/runtime/framework/core/framework.go:69-90
-func New(ctx context.Context, client client.Client, opts ...Option) (*Framework, error) {
-    f := &Framework{}
-
-    // 注册 MLPolicy 插件
-    for name, factory := range options.enforceMLPolicyPlugins {
-        f.enforceMLPolicyPlugins = append(f.enforceMLPolicyPlugins,
-            factory(client))
-    }
-
-    return f, nil
-}
-
-// 默认插件注册
-// pkg/runtime/framework/plugins/registry.go
-var DefaultEnforceMLPolicyPlugins = map[string]EnforceMLPolicyPluginFactory{
-    torch.Name:     torch.New,
-    mpi.Name:       mpi.New,
-    deepspeed.Name: deepspeed.New,
-}
-```
-
-### 调用时机
-
-```
-TrainJob Reconcile:
-    Get TrainJob
-         │
-         ▼
-    Get RuntimeSpec
-         │
-         ▼
-    ┌────────────────────────────────────────────┐
-    │  RunEnforceMLPolicyPlugins                 │
-    │  ┌──────────┐ ┌──────────┐ ┌──────────┐   │
-    │  │  Torch   │→│   MPI    │→│DeepSpeed │   │
-    │  └──────────┘ └──────────┘ └──────────┘   │
-    └────────────────────────────────────────────┘
-         │
-         ▼
-    RunEnforceCustomizationPlugins
-         │
-         ▼
-    BuildObjects (JobSet)
-```
-
-### 隔离与配额
-
-| 隔离机制 | 配置 | 目的 |
-|:---------|:-----|:-----|
-| 接口契约 | 只能修改 Info | 防止插件越权 |
-| 执行顺序 | 固定顺序 | 保证确定性 |
-| 错误处理 | 返回 nil 跳过 | 单插件失败不影响其他 |
-
-### 现有实现
-
-| 实现 | 用途 | 源码位置 |
-|:-----|:-----|:---------|
-| Torch | PyTorch 分布式训练 | `pkg/runtime/framework/plugins/torch/` |
-| MPI | MPI 分布式训练 | `pkg/runtime/framework/plugins/mpi/` |
-| DeepSpeed | DeepSpeed 训练 | `pkg/runtime/framework/plugins/deepspeed/` |
+`pkg/runtime/core/trainingruntime.go:RuntimeInfo`（先构建 `runtime.Info`，再执行该阶段插件）。
 
 ---
 
-## Extension Point 2: EnforceCustomization
+## Extension Point 2：`EnforcePodGroupPolicyPlugin`
 
 ### 设计意图
 
-支持不同的调度策略和资源定制：
-- Gang 调度: Volcano 或 Coscheduling
-- PodGroup 配置
-- 自定义 Pod 模板覆盖
+Gang 调度器（scheduler-plugins / Volcano）的差异体现在：
+- Pod 上需要哪些 labels/annotations
+- 是否需要额外创建 PodGroup 资源
 
-### 接口定义
+“注入 Pod labels”属于该阶段，真正创建 PodGroup 属于 `ComponentBuilderPlugin`（同一个插件可同时实现两者）。
+
+### 接口（精简版）
 
 ```go
-// pkg/runtime/framework/interface.go:50-58
-type EnforceCustomizationPlugin interface {
-    Name() string
-
-    EnforceCustomization(
-        info *runtime.Info,
-        trainJob *trainer.TrainJob,
-        runtimeSpec *trainer.TrainingRuntimeSpec,
-    ) *runtime.Info
+type EnforcePodGroupPolicyPlugin interface {
+    Plugin
+    EnforcePodGroupPolicy(info *runtime.Info, trainJob *trainer.TrainJob) error
 }
 ```
 
-### 现有实现
-
-| 实现 | 用途 | 源码位置 |
-|:-----|:-----|:---------|
-| Coscheduling | scheduler-plugins Gang 调度 | `pkg/runtime/framework/plugins/coscheduling/` |
-| Volcano | Volcano Gang 调度 | `pkg/runtime/framework/plugins/volcano/` |
-| JobSet | JobSet 模板定制 | `pkg/runtime/framework/plugins/jobset/` |
-
 ---
 
-## Extension Point 3: ComponentBuilder
+## Extension Point 3：`PodNetworkPlugin`
 
 ### 设计意图
 
-构建 TrainJob 所需的 Kubernetes 资源对象：
-- JobSet: 核心工作负载
-- Secret: MPI SSH 密钥
-- ConfigMap: MPI hostfile
+统一生成“训练通信需要的 endpoints”：
+- Torch：master addr（默认 `...-node-0-0.<subdomain>`）
+- MPI：hostfile（每行一个 endpoint）
 
-### 接口定义
+### 接口（精简版）
 
 ```go
-// pkg/runtime/framework/interface.go:60-72
+type PodNetworkPlugin interface {
+    Plugin
+    IdentifyPodNetwork(info *runtime.Info, trainJob *trainer.TrainJob) error
+}
+```
+
+---
+
+## Extension Point 4：`ComponentBuilderPlugin`
+
+### 设计意图
+
+把 `runtime.Info`（抽象/中间态）变成最终要 Apply 的对象集合：
+- JobSet（核心 workload）
+- PodGroup（可选）
+- MPI Secret / ConfigMap（可选）
+
+### 接口（精简版）
+
+```go
 type ComponentBuilderPlugin interface {
-    Name() string
-
-    // Build 构建 Kubernetes 对象
-    Build(
-        ctx context.Context,
-        info *runtime.Info,
-        trainJob *trainer.TrainJob,
-        runtimeSpec *trainer.TrainingRuntimeSpec,
-    ) ([]client.Object, error)
+    Plugin
+    Build(ctx context.Context, info *runtime.Info, trainJob *trainer.TrainJob) ([]apiruntime.ApplyConfiguration, error)
 }
-```
-
-### 构建流程
-
-```
-RunComponentBuilderPlugins:
-    ┌──────────────────────────────────────────────┐
-    │  JobSet Plugin                               │
-    │  ┌────────────────────────────────────────┐  │
-    │  │ 1. 构建 JobSet spec                    │  │
-    │  │ 2. 应用 PodSpecOverrides               │  │
-    │  │ 3. 设置 OwnerReference                 │  │
-    │  └────────────────────────────────────────┘  │
-    │                    │                         │
-    │                    ▼                         │
-    │  ┌────────────────────────────────────────┐  │
-    │  │ Output: JobSet ApplyConfiguration      │  │
-    │  └────────────────────────────────────────┘  │
-    └──────────────────────────────────────────────┘
-         │
-         │  (如果是 MPI 训练)
-         ▼
-    ┌──────────────────────────────────────────────┐
-    │  MPI Plugin (Build 阶段)                     │
-    │  ┌────────────────────────────────────────┐  │
-    │  │ 1. 生成 SSH 密钥对                     │  │
-    │  │ 2. 创建 Secret                         │  │
-    │  │ 3. 创建 hostfile ConfigMap             │  │
-    │  └────────────────────────────────────────┘  │
-    │                    │                         │
-    │                    ▼                         │
-    │  ┌────────────────────────────────────────┐  │
-    │  │ Output: Secret + ConfigMap             │  │
-    │  └────────────────────────────────────────┘  │
-    └──────────────────────────────────────────────┘
 ```
 
 ---
 
-## Extension Point 4: Webhook (Validate)
+## Extension Point 5：`CustomValidationPlugin`（Webhook 侧）
 
 ### 设计意图
 
-在资源创建/更新时进行验证：
-- 检查保留环境变量
-- 检查 PodTemplateOverrides 修改条件
-- 自定义验证规则
+把“用户能不能这样配”提前在 admission 阶段阻断：
+- 运行中不可修改的字段（如 `podTemplateOverrides` 的限制）
+- 运行时保留 env（如 Torch 的 `PET_*`）
+- MPI/TorchTune 的参数约束
 
-### 接口定义
+### 接口（精简版）
 
 ```go
-// pkg/runtime/framework/interface.go:74-82
+type CustomValidationPlugin interface {
+    Plugin
+    Validate(ctx context.Context, info *runtime.Info, oldObj, newObj *trainer.TrainJob) (admission.Warnings, field.ErrorList)
+}
+```
+
+---
+
+## Extension Point 6：`WatchExtensionPlugin`
+
+### 设计意图
+
+TrainJob controller 默认只 watch TrainJob；但很多收敛点来自“派生资源变化”：
+- JobSet 状态变化 -> 触发 TrainJob reconcile 更新 status
+- MPI Secret/ConfigMap 变化 -> 触发 TrainJob reconcile
+- PodGroup/RuntimeClass/LimitRange 变化（gang 调度相关）-> 触发（通常只对 suspended TrainJob 有意义）
+
+### 接口（精简版）
+
+```go
 type WatchExtensionPlugin interface {
-    Name() string
-
-    // Validate 验证 TrainJob
-    Validate(oldObj, newObj *trainer.TrainJob) (admission.Warnings, field.ErrorList)
-}
-```
-
-### 调用时机
-
-```
-Webhook (Validating):
-    Create/Update TrainJob
-         │
-         ▼
-    ┌──────────────────────────────────────────────┐
-    │  Framework.RunWatchExtensionPlugins          │
-    │  ┌──────────┐ ┌──────────┐ ┌──────────┐     │
-    │  │  Torch   │→│  JobSet  │→│   ...    │     │
-    │  │ Validate │ │ Validate │ │          │     │
-    │  └──────────┘ └──────────┘ └──────────┘     │
-    │                    │                         │
-    │                    ▼                         │
-    │       合并所有 Warnings 和 Errors            │
-    └──────────────────────────────────────────────┘
-         │
-         ▼
-    允许/拒绝请求
-```
-
----
-
-## Extension Point 5: Runtime
-
-### 设计意图
-
-支持不同作用域的 Runtime：
-- TrainingRuntime: 命名空间级
-- ClusterTrainingRuntime: 集群级
-
-### 接口定义
-
-```go
-// pkg/runtime/interface.go:26-38
-type Runtime interface {
-    // GetRuntimeSpec 获取 Runtime 规格
-    GetRuntimeSpec(
-        ctx context.Context,
-        trainJob *trainer.TrainJob,
-    ) (*trainer.TrainingRuntimeSpec, error)
-
-    // BuildObjects 构建 Kubernetes 对象
-    BuildObjects(
-        ctx context.Context,
-        info *Info,
-        trainJob *trainer.TrainJob,
-        runtimeSpec *trainer.TrainingRuntimeSpec,
-    ) ([]client.Object, error)
-}
-```
-
-### 注册机制
-
-```go
-// pkg/runtime/core/registry.go
-func NewRuntimeRegistry(client client.Client, fwk *framework.Framework) RuntimeRegistry {
-    return map[string]runtime.Runtime{
-        // 命名空间级 Runtime
-        runtimeRefKey(trainer.TrainingRuntimeKind): NewTrainingRuntime(client, fwk),
-
-        // 集群级 Runtime
-        runtimeRefKey(trainer.ClusterTrainingRuntimeKind): NewClusterTrainingRuntime(client, fwk),
-    }
+    Plugin
+    ReconcilerBuilders() []runtime.ReconcilerBuilder
 }
 ```
 
 ---
 
-## 扩展点治理
+## 顺序、隔离与“不要写顺序依赖”
 
-### 生命周期
-
-```
-Alpha (实验性) → Beta (功能完整) → Stable (生产可用)
-     │                                    │
-     └────── 可能被移除或大幅修改 ─────────┘
-```
-
-当前各扩展点状态：
-
-| 扩展点 | 状态 | 说明 |
-|:-------|:-----|:-----|
-| EnforceMLPolicy | Beta | Torch/MPI 稳定，DeepSpeed 开发中 |
-| EnforceCustomization | Beta | Coscheduling/Volcano 支持 |
-| ComponentBuilder | Beta | JobSet 构建稳定 |
-| Webhook | Stable | 验证机制成熟 |
-| Runtime | Stable | 核心接口稳定 |
-
-### 兼容性规则
-
-- [x] 新增扩展点：向后兼容，新插件不影响现有功能
-- [x] 修改扩展接口：需要版本化（v1alpha1 → v1beta1）
-- [ ] 移除扩展点：提前 2 个版本标记 Deprecated
+- 执行顺序按“阶段”固定：MLPolicy → PodGroupPolicy → PodNetwork → Build
+- 同一阶段内的插件顺序来自 registry 的遍历（Go map 无序），**不应依赖先后**
+- 常用的顺序隔离手段：
+  - 配置守卫：`if info.RuntimePolicy.MLPolicySource.MPI == nil { return nil }`
+  - ancestor 守卫：只修改特定 PodSet/Container
 
 ---
 
-## 如何添加新插件
+## 如何添加新插件（最短路径）
 
-### 步骤 1: 实现接口
+1) 实现所需接口（可实现多个）：
 
 ```go
-// pkg/runtime/framework/plugins/myplugin/myplugin.go
 package myplugin
 
 const Name = "MyPlugin"
 
-type MyPlugin struct {
-    client client.Client
-}
+type MyPlugin struct{}
 
-func New(client client.Client) framework.EnforceMLPolicyPlugin {
-    return &MyPlugin{client: client}
+func New(context.Context, client.Client, client.FieldIndexer) (framework.Plugin, error) {
+    return &MyPlugin{}, nil
 }
-
-func (p *MyPlugin) Name() string {
-    return Name
-}
-
-func (p *MyPlugin) EnforceMLPolicy(
-    info *runtime.Info,
-    trainJob *trainer.TrainJob,
-    runtimeSpec *trainer.TrainingRuntimeSpec,
-) *runtime.Info {
-    // 实现逻辑
-    return info
-}
+func (p *MyPlugin) Name() string { return Name }
 ```
 
-### 步骤 2: 注册插件
+2) 在 `pkg/runtime/framework/plugins/registry.go:NewRegistry` 注册：
+- `myplugin.Name: myplugin.New`
 
-```go
-// pkg/runtime/framework/plugins/registry.go
-var DefaultEnforceMLPolicyPlugins = map[string]EnforceMLPolicyPluginFactory{
-    torch.Name:     torch.New,
-    mpi.Name:       mpi.New,
-    myplugin.Name:  myplugin.New,  // 新增
-}
-```
-
-### 步骤 3: 添加测试
-
-```go
-// pkg/runtime/framework/plugins/myplugin/myplugin_test.go
-func TestMyPluginEnforceMLPolicy(t *testing.T) {
-    // 测试用例
-}
-```
+3) 加测试（优先放在插件目录下的 `_test.go`，对 `runtime.Info` 的变更与输出对象做断言）。
 
 ---
 
 ## 反模式警示
 
-| 反模式 | 描述 | 风险 |
-|:-------|:-----|:-----|
-| 插件相互依赖 | Plugin A 依赖 Plugin B 的输出 | 顺序敏感，难以测试 |
-| 过度扩展 | 所有配置都做成插件 | 复杂度爆炸 |
-| 接口过于宽泛 | Info 包含太多可修改字段 | 难以追踪变更 |
-
----
-
-## 评估矩阵
-
-| 扩展点 | 使用频率 | 实现数量 | 稳定性 | 文档完善度 |
-|:-------|:---------|:---------|:-------|:-----------|
-| EnforceMLPolicy | 高 | 3 | Beta | 完善 |
-| EnforceCustomization | 中 | 3 | Beta | 完善 |
-| ComponentBuilder | 高 | 2 | Beta | 完善 |
-| Webhook | 中 | 2 | Stable | 待改进 |
-| Runtime | 高 | 2 | Stable | 完善 |
+| 反模式 | 风险 |
+|:--|:--|
+| 插件 A 依赖插件 B 的执行顺序 | registry 无序 → 结果不确定，难以复现/测试 |
+| 在插件里修改 TrainJob spec | 容易引入副作用；除非非常明确（例如 TorchTune 的命令补齐） |
+| 让插件直接操作 client 写资源 | 破坏 SSA/幂等，难以追踪 ownership 与变更来源 |

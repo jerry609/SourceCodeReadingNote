@@ -2,11 +2,46 @@
 
 ## 待解决
 
-- [ ] 弹性训练 (Elastic Training) 如何实现？目前 TorchElasticPolicy 定义了 minNodes/maxNodes，但具体实现似乎尚未完成
-- [ ] 多租户场景下，如何限制 TrainJob 只能引用特定的 ClusterTrainingRuntime？
-- [ ] 如何处理训练过程中的 checkpoint 持久化？
+- [ ] （欢迎补充新问题）
 
 ## 已解决
+
+### Q: 弹性训练 (Elastic Training) 如何实现？
+
+**A: 当前代码仅提供了 API/Schema 字段，控制面尚未实现弹性伸缩。**
+
+- `TorchElasticPolicy` 已在 CRD 类型中定义（包含 `minNodes/maxNodes/maxRestarts/metrics`）：`pkg/apis/trainer/v1alpha1/trainingruntime_types.go`
+- Torch 插件里明确标注了待办：`pkg/runtime/framework/plugins/torch/torch.go` 的 TODO（需要 JobSet 支持 Elastic Jobs）
+- 现状：Trainer 不会基于 `elasticPolicy.metrics` 创建 HPA，也不会把 `--nnodes=min:max` 之类的参数注入到 torchrun（仍以 `TrainJob.Spec.Trainer.NumNodes` 覆盖 Pod 数为主）
+
+---
+
+### Q: 多租户场景下，如何限制 TrainJob 只能引用特定的 ClusterTrainingRuntime？
+
+**A: Trainer 目前没有“内建租户策略”字段/控制逻辑，通常需要借助 Kubernetes Admission/Policy。**
+
+原因：TrainJob 的校验由 Trainer 的 webhook 执行（`pkg/webhooks/trainjob_webhook.go`），其检查 runtime 是否存在并执行插件校验，但不会按 namespace/tenant 做引用白名单控制。
+
+可行做法（按常见落地路径排序）：
+1. **集群侧策略**：用 `ValidatingAdmissionPolicy`（CEL）、Kyverno、OPA Gatekeeper 等在 admission 阶段拒绝不允许的 `.spec.runtimeRef.name/.spec.runtimeRef.kind`
+2. **自定义 webhook**：实现一个额外的 validating webhook，根据 namespace/labels/annotations 维护“允许引用哪些 ClusterTrainingRuntime”的规则
+3. **平台约定**：把 runtime 按租户拆为 namespaced `TrainingRuntime`（避免 cluster-scoped 共享），并通过 RBAC 控制谁能创建/修改这些 runtimes（但 RBAC 本身无法阻止“引用名字”，需要 admission 才能真正拒绝）
+
+---
+
+### Q: 如何处理训练过程中的 checkpoint 持久化？
+
+**A: Trainer 不直接管理 checkpoint，靠 runtime 模板/PodTemplateOverrides 把持久化卷挂进训练容器。**
+
+常见模式：
+- 在 (Cluster)TrainingRuntime 的 JobSet 模板里声明 PVC/CSI 等 volume + mount（或用 `.spec.podTemplateOverrides` 给 TrainJob 动态追加）
+- 训练脚本把输出目录指向该挂载点
+
+TorchTune 场景的补充：Torch 插件会从 runtime 模板中提取并“固化”一部分关键 override（包含 checkpoint/output/tokenizer 等配置）并追加到命令行：
+- 提取逻辑：`pkg/runtime/framework/plugins/torch/torchtune.go:extractOverridesFromRuntime`
+- 固化的 key 集合：`pkg/constants/constants.go: TorchTuneImmutableConfigs`（含 `checkpointer.checkpoint_dir` 等）
+
+---
 
 ### Q: 为什么 TrainJob 使用 JobSet 而不是直接创建 Job？
 
@@ -55,7 +90,10 @@ if completed := meta.FindStatusCondition(jobSet.Status.Conditions, string(jobset
 // pkg/runtime/framework/plugins/mpi/mpi.go:286-293
 return corev1ac.Secret(sshAuthSecretName(trainJob.Name), trainJob.Namespace).
     WithType(corev1.SecretTypeSSHAuth).
-    WithData(map[string][]byte{...}).
+    WithData(map[string][]byte{
+        corev1.SSHAuthPrivateKey:  privatePEM,
+        constants.MPISSHPublicKey: ssh.MarshalAuthorizedKey(publicKey),
+    }).
     WithImmutable(true).
     WithOwnerReferences(ownerRef), nil
 ```
