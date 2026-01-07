@@ -178,6 +178,10 @@ end
 return {ino, redis.call('GET', "i" .. string.format("%.f", ino))}  -- 返回 inode + attr
 ```
 
+**启用条件（重要）**：
+- 仅在 Redis **非 Cluster 前缀模式**、且 `CaseInsensi`（大小写不敏感）未开启时启用。
+- 在 Redis Cluster 场景，JuiceFS 会用 `{db}` 这样的 hash-tag 前缀让所有 key 落在同一 slot；但脚本里 hardcode 的 `"i".."d"` key 无法自动带前缀，因此会退化为 pipeline/分步命令路径。
+
 ### scriptResolve (pkg/meta/lua_scripts.go:33-104)
 路径解析脚本，支持多级目录查找：
 

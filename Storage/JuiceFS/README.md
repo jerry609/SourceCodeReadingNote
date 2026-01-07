@@ -6,6 +6,8 @@
 *   **一句话描述**: 插件化元数据引擎 + 对象存储，实现高性能、无限扩展的 POSIX 文件系统。
 *   **阅读目标**: 建立心智模型，理清数据流与元数据流，为 Rust 重写打下基础。
 
+快速阅读路线：[`Storage/JuiceFS/reading-guide.md`](reading-guide.md)
+
 ## 2. 核心架构 (Architecture)
 JuiceFS 采用元数据与数据完全分离的架构：
 
@@ -40,6 +42,7 @@ JuiceFS 采用元数据与数据完全分离的架构：
 ```
 
 ## 3. 关键路径 (Critical Paths)
+- [启动流程](flows/startup.md): `juicefs mount` 如何组装 meta/object/chunk/vfs。
 - [Lookup 流程](flows/lookup.md): 目录项查找与元数据获取。
 - [Write 流程](flows/write.md): 数据分块、上传对象存储、更新元数据。
 - [Read 流程](flows/read.md): 获取 Slice 列表、从对象存储拉取、缓存。

@@ -1,11 +1,69 @@
 # 疑问与解答 (Q&A)
 
 ## 待解决
-- [ ] Redis 事务保证：`WATCH` + `MULTI` 如何在分布式环境下保证元数据一致性？
-- [ ] TiKV 后端的 MVCC 特性如何被 JuiceFS 利用？
-- [ ] 如何实现跨客户端的缓存一致性（非 Redis Client Tracking 场景）？
+- [ ] （欢迎补充新问题）
 
 ## 已解决
+
+### Q13: Redis 事务保证：`WATCH` + `MULTI` 如何在分布式环境下保证元数据一致性？
+
+**A: JuiceFS 用“乐观事务 + 重试 +（Cluster 场景）hash-tag 前缀”来保证多 key 更新的原子性。**
+
+关键点：
+1. **事务包装器**：Redis 后端把涉及多 key 的更新统一走 `redisMeta.txn(...)`：
+   - `m.rdb.Watch(ctx, txf, keys...)` 监视 key
+   - `txf(tx)` 内部用 `tx.TxPipelined(...)` 执行（底层 `MULTI/EXEC`）
+   - 冲突时会返回 `redis.TxFailedErr` 等错误，外层按策略重试（带随机退避，最多 50 次）
+2. **Cluster 场景的“同 slot”保证**：当检测到 Redis Cluster 时，JuiceFS 会设置 `prefix = fmt.Sprintf("{%d}", opt.DB)`，所有 key 形如：
+   - `{db}i<inode>`, `{db}d<inode>`, `{db}c<inode>_<idx>` …
+   这样所有 key 落在同一个 hash slot 上，Lua/事务/多 key 操作才能在 Cluster 中正常工作。
+
+关联代码：
+- `pkg/meta/redis.go:txn`（Watch + 重试 + 本地分段锁 `txLock`）
+- `pkg/meta/redis.go:newRedisMeta`（Cluster 模式设置 `{db}` 前缀）
+
+---
+
+### Q14: TiKV 后端的 MVCC 特性如何被 JuiceFS 利用？
+
+**A: JuiceFS 通过 TiKV 的事务 API（MVCC 时间戳 + Snapshot/Commit）获得可重试的原子更新与一致读。**
+
+落地方式：
+1. **事务读写 = MVCC 的一次“快照 + 提交”**
+   - `tikvClient.txn(...)` 内部 `Begin()` 得到 `KVTxn`，读到的是该事务 startTS 的一致快照
+   - 写入在 `Commit()` 时才对外可见（MVCC 提交）
+2. **性能优化**
+   - `tx.SetEnable1PC(true)` + `tx.SetEnableAsyncCommit(true)`：尽量走 1PC / 异步提交，减少提交往返
+3. **冲突与重试**
+   - `tikvClient.shouldRetry` 针对 write conflict / lock not found 等错误返回 true，上层 kvMeta 会做重试（类似 Redis 的乐观并发）
+4. **只读点查（避免 PD 开销）**
+   - `simpleTxn` 里用 `Begin(tikv.WithStartTS(math.MaxUint64))`，表示“直接读取最新已提交数据”，减少一次 PD/Tso 交互
+5. **与 GC safe point 的互动**
+   - scan 路径里遇到 `ErrGCTooEarly` 会重启 scan（换新的 timestamp/snapshot）
+   - 后台按 `gc-interval` 触发 TiKV GC，推进 safe point
+
+关联代码：
+- `pkg/meta/tkv_tikv.go`（txn/simpleTxn/scan/gc）
+
+---
+
+### Q15: 如何实现跨客户端的缓存一致性（非 Redis Client Tracking 场景）？
+
+**A: 主要是“TTL 缓存 + 局部失效”，不追求强一致；需要更强一致时只能牺牲缓存或引入额外机制。**
+
+JuiceFS 的缓存分层与一致性手段：
+1. **FUSE/客户端侧元数据缓存（最常见）**
+   - 由 mount 参数控制 TTL：`--entry-cache`、`--attr-cache`、`--dir-entry-cache`、`--negative-entry-cache` 等
+   - 本质是“允许短时间读到旧的 dentry/attr”，靠 TTL 收敛
+2. **本地内核缓存失效（只影响当前挂载点）**
+   - JuiceFS 可以通过 FUSE notify（如 `EntryNotify`）让 *本机内核* 失效 dentry 缓存
+   - 但**不会广播到其他客户端**，跨客户端仍靠 TTL/重新查询 meta
+3. **数据缓存（chunk/block/page）**
+   - 内容缓存通常通过校验/版本信息（mtime/size/slice list）在 TTL 到期后重新拉取 slice mapping 以收敛
+   - 若把 TTL 配得很大或开启 `open-cache` 之类复用，会显著放大“跨客户端看见更新的延迟”
+
+结论：非 Tracking 场景下，跨客户端一致性是“可调的最终一致”。
+要更强一致：降低 TTL / 关掉某些缓存（代价是性能与后端压力上升）。
 
 ### Q1: JuiceFS 的数据如何分层组织？
 **A:** JuiceFS 采用四级数据分层：

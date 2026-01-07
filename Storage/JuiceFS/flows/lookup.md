@@ -16,7 +16,7 @@ graph TD
         E -- "命中" --> C
         
         E -- "未命中" --> F{Lua 脚本优化可用?}
-        F -- "是" --> G[执行 scriptLookup.lua]
+        F -- "是" --> G[执行 scriptLookup (Lua)]
         G -- "HGET + GET 一次往返" --> H[获取 Inode + Attr]
         
         F -- "否" --> I[分步执行 Redis 命令]
@@ -37,7 +37,7 @@ graph TD
 
 ### 2. 原子性与往返优化 (Lua Scripting)
 - 传统的做法是先查 inode，再查属性，需要两次网络 RTT。
-- JuiceFS 将此逻辑写成 Lua 脚本：
+- JuiceFS 在 Redis 后端里提供了对应的 Lua 脚本（`pkg/meta/lua_scripts.go:scriptLookup`），用于把 `HGET + GET` 合并成一次请求：
   ```lua
   local inode = redis.call('HGET', KEYS[1], ARGV[1])
   if inode then
@@ -45,11 +45,16 @@ graph TD
       return {inode, attr}
   end
   ```
-- 这种优化将元数据查询性能提升了近一倍。
+- 注意：该脚本只在 **非大小写不敏感** 且 **非 Redis Cluster 前缀模式** 下启用（代码里会判断 `CaseInsensi` 和 `prefix`）。在 Cluster 场景，JuiceFS 会给所有 key 加 `{db}` 这样的 hash-tag 前缀来保证多 key 操作落在同一 slot，但脚本里硬编码的 `i.../d...` key 不能自动带前缀，因此会退化为 pipeline/分步命令。
 
 ### 3. 客户端缓存 (Client-side Caching)
-- 客户端可以配置元数据缓存（`--metacache`）。
-- 缓存项包含 `cachedEntry`，记录了父目录、文件名与 inode 的映射关系。
+- **文件系统侧缓存（最常见）**：通过 mount 参数控制内核/客户端缓存 TTL，例如：
+  - `--entry-cache`（dentry/entry cache）
+  - `--attr-cache`（属性缓存）
+  - `--dir-entry-cache`、`--negative-entry-cache`、`--readdir-cache`
+  （见 `cmd/flags.go:metaCacheFlags`）
+- **Redis 元数据侧缓存（可选）**：在 meta URL 上开启 `client-cache=true`（`pkg/meta/redis.go`），利用 Redis 6.0+ 的 Client Tracking（`pkg/meta/redis_csc.go`）做 server-assisted invalidation。
+- 缓存命中能显著降低 Lookup 的 RTT，但一致性通常依赖 TTL 或 invalidation 机制（Tracking/notify）。
 
 ## Rust 重写思考
 
