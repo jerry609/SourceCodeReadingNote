@@ -10,7 +10,9 @@
 | [JuiceFS](Storage/JuiceFS/) | 分布式 POSIX 文件系统 | Go | ✅ 进行中 |
 
 ### AI 基础设施 (AI-Infrastructure)
-*待补充...*
+| 项目 | 类型 | 语言 | 状态 |
+|:-----|:-----|:-----|:-----|
+| [Kubeflow Trainer](AI-Infrastructure/trainer/) | K8s 分布式训练 Operator | Go | ✅ 完成 |
 
 ### AI 模型 (AI-Models)
 *待补充...*
@@ -39,7 +41,16 @@ Project/
 ├── highlights.md      # 印象深刻之处 - 值得学习的设计
 ├── algorithms.md      # 关键算法 - 原理与复杂度分析
 ├── tradeoffs.md       # 权衡取舍 - 设计决策分析
-└── exercises/         # 实战练习 (如 Rust 重写任务)
+├── exercises/         # 实战练习 (如 Rust 重写任务)
+│
+│   # 系统设计哲学 (可选，适用于复杂系统)
+├── invariants.md      # 不变量分析 - 系统必须维护的核心约束
+├── control-data-plane.md  # 控制面与数据面分离
+├── reconcile-loops.md # 闭环设计 - Reconcile Loop 模式
+├── extension-points.md    # 扩展点设计 - 插件机制分析
+├── evolution-strategy.md  # 演进策略 - 版本管理与迁移
+├── anti-patterns.md   # 反模式识别
+└── sot-analysis.md    # 真相之源分析 - 数据权威性
 ```
 
 ## 笔记特色
@@ -50,6 +61,7 @@ Project/
 - **惊艳之处**: 记录令人印象深刻的设计，可在其他项目借鉴
 - **算法详解**: 包含复杂度分析和伪代码
 - **权衡分析**: 理解每个设计决策的利弊
+- **系统设计哲学**: 分析不变量、控制/数据面分离、闭环设计等架构模式
 
 ## 如何使用
 
@@ -58,6 +70,7 @@ Project/
 3. **理解核心流程**: 阅读 `flows/` 下的路径分析
 4. **学习设计技巧**: 阅读 `highlights.md` 和 `algorithms.md`
 5. **理解设计决策**: 阅读 `tradeoffs.md`
+6. **学习架构哲学**: 阅读系统设计哲学相关文件 (invariants, reconcile-loops 等)
 
 ## License
 
