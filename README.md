@@ -7,7 +7,7 @@
 ### 存储系统 (Storage)
 | 项目 | 类型 | 语言 | 状态 |
 |:-----|:-----|:-----|:-----|
-| [JuiceFS](Storage/JuiceFS/) | 分布式 POSIX 文件系统 | Go | ✅ 进行中 |
+| [JuiceFS](Storage/JuiceFS/) | 分布式 POSIX 文件系统 | Go | ✅ 完成 |
 
 ### AI 基础设施 (AI-Infrastructure)
 | 项目 | 类型 | 语言 | 状态 |
