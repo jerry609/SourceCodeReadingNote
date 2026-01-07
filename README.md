@@ -13,6 +13,7 @@
 | 项目 | 类型 | 语言 | 状态 |
 |:-----|:-----|:-----|:-----|
 | [Kubeflow Trainer](AI-Infrastructure/trainer/) | K8s 分布式训练 Operator | Go | ✅ 完成 |
+| [Tinker](AI-Infrastructure/tinker/) | 训练/采样服务 Python SDK | Python | ✅ 进行中 |
 
 ### AI 模型 (AI-Models)
 *待补充...*
